@@ -8,6 +8,7 @@
 #include <iostream>
 #include <thread>
 #include <unistd.h>
+#include <stdarg.h>
 
 #define MAX_BUFFERS 32
 #define TEST_ERROR(condition, message, errorCode)    \
@@ -36,8 +37,9 @@ struct nvmpictx
 	uint32_t qmin;
 	uint32_t num_b_frames;
 	uint32_t num_reference_frames;
-	uint32_t vbv_buffer_size; //virtual buffer size of the encoder
+	uint32_t vbv_buffer_size;
 	uint32_t packets_num;
+	uint32_t slice_length;
 
 	bool insert_sps_pps_at_idr;
 	bool max_perf; //enable max performance mode
@@ -46,16 +48,27 @@ struct nvmpictx
 	bool blocking_mode;
 	bool capPlaneGotEOS;
 	bool flushing;
+	bool enable_slice_level_encode;
+	bool disable_cabac;
 
 	enum v4l2_mpeg_video_bitrate_mode ratecontrol;
 	enum v4l2_mpeg_video_h264_level level;
 	enum v4l2_enc_hw_preset_type hw_preset_type;
+	v4l2_enc_slice_length_type slice_length_type;
 
 	NvVideoEncoder *enc;
 	NVMPI_bufPool<nvPacket*>* pktPool;
 	//int output_plane_fd[32]; //TODO
 };
 
+void log_info(const char *fmt, ...) {
+	printf("\033[36m >> NVMPI: ");
+	va_list vl;
+	va_start(vl, fmt);
+	vprintf(fmt, vl);
+	va_end(vl);
+	printf("\033[0m");
+}
 
 static bool encoder_capture_plane_dq_callback(struct v4l2_buffer *v4l2_buf, NvBuffer * buffer, NvBuffer * shared_buffer __attribute__((unused)), void *arg)
 {
@@ -73,10 +86,10 @@ static bool encoder_capture_plane_dq_callback(struct v4l2_buffer *v4l2_buf, NvBu
 		cout << "Got 0 size buffer in capture \n";
 		return false;
 	}
-	
+
 	v4l2_ctrl_videoenc_outputbuf_metadata enc_metadata;
 	ctx->enc->getMetadata(v4l2_buf->index, enc_metadata);
-	
+
 	//nvPacket.payload --> AVPacket->data
 	//nvPacket.privData --> AVPacket
 	nvPacket* pkt = ctx->pktPool->dqEmptyBuf();
@@ -92,10 +105,10 @@ static bool encoder_capture_plane_dq_callback(struct v4l2_buffer *v4l2_buf, NvBu
 		pkt->flags|= 0x0001;//AV_PKT_FLAG_KEY 0x0001
 		pkt->payload_size = buffer->planes[0].bytesused;
 		memcpy(pkt->payload, buffer->planes[0].data, pkt->payload_size);
-		
+
 		ctx->pktPool->qFilledBuf(pkt);
 	}
-	
+
 	if (ctx->enc->capture_plane.qBuffer(*v4l2_buf, NULL) < 0)
 	{
 		//TODO error handling
@@ -123,7 +136,7 @@ static int setup_output_dmabuf(nvmpictx *ctx, uint32_t num_buffers )
         cParams.width = ctx->width;
         cParams.height = ctx->height;
         cParams.layout = NVBUF_LAYOUT_PITCH;
-        
+
         switch (ctx->cs)
         {
             case V4L2_COLORSPACE_REC709:
@@ -149,8 +162,8 @@ static int setup_output_dmabuf(nvmpictx *ctx, uint32_t num_buffers )
                     cParams.colorFormat = NVBUF_COLOR_FORMAT_YUV444;
             }
         }
-        
-        
+
+
         else if (ctx->encoder_pixfmt == V4L2_PIX_FMT_H265)
         {
             if (ctx->chroma_format_idc == 3)
@@ -168,7 +181,7 @@ static int setup_output_dmabuf(nvmpictx *ctx, uint32_t num_buffers )
                 cParams.colorFormat = NVBUF_COLOR_FORMAT_NV12_10LE;
             }
         }
-        
+
         cParams.colorFormat = NVBUF_COLOR_FORMAT_YUV420;
         cParams.memtag = NvBufSurfaceTag_VIDEO_ENC;
         cParams.memType = NVBUF_MEM_SURFACE_ARRAY;
@@ -185,135 +198,193 @@ static int setup_output_dmabuf(nvmpictx *ctx, uint32_t num_buffers )
 }
 */
 
-
-nvmpictx* nvmpi_create_encoder(nvCodingType codingType,nvEncParam * param)
+nvmpictx* nvmpi_create_encoder(nvCodingType codingType, nvEncParam * param)
 {
+	log_info("nvmpi_create_encoder\n");
 	int ret;
 	log_level = LOG_LEVEL_INFO;
-	//log_level = LOG_LEVEL_DEBUG;
-	nvmpictx *ctx=new nvmpictx;
-	ctx->index=0;
-	ctx->width=param->width;
-	ctx->height=param->height;
-	ctx->enableLossless=false;
-	ctx->bitrate=param->bitrate;
-	ctx->ratecontrol = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR;	
-	ctx->idr_interval = param->idr_interval;
-	ctx->fps_n = param->fps_n;
-	ctx->fps_d = param->fps_d;
-	ctx->iframe_interval = param->iframe_interval;
-	ctx->pktPool = new NVMPI_bufPool<nvPacket*>();
-	ctx->enable_extended_colorformat=false;
-	ctx->packets_num=param->capture_num;
-	ctx->qmax=param->qmax;
-	ctx->qmin=param->qmin;
-	ctx->num_b_frames=param->max_b_frames;
-	ctx->num_reference_frames=param->refs;
-	ctx->insert_sps_pps_at_idr=(param->insert_spspps_idr==1)?true:false;
-	ctx->capPlaneGotEOS = false;
-	ctx->flushing = false;
-	ctx->blocking_mode = true; //TODO non-blocking mode support
-	ctx->max_perf = true; //TODO invistigate why encoder is slow without max_perf even with MAXN power mode
-	ctx->vbv_buffer_size = param->vbv_buffer_size;
-	
+	// log_level = LOG_LEVEL_DEBUG;
+	nvmpictx *ctx = new nvmpictx;
+	*ctx = {};
+	ctx->index = 0;
+	ctx->width = param->width;
+	ctx->height = param->height;
+	log_info("Dimensions %ux%u\n", ctx->width, ctx->height);
+
 	switch(param->profile)
 	{
 		case 77://FF_PROFILE_H264_MAIN
 			ctx->profile=V4L2_MPEG_VIDEO_H264_PROFILE_MAIN;
+			log_info("Profile set to MAIN\n");
 			break;
 		case 66://FF_PROFILE_H264_BASELINE
 			ctx->profile=V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE;
+			log_info("Profile set to BASELINE\n");
 			break;
 		case 100://FF_PROFILE_H264_HIGH
 			ctx->profile=V4L2_MPEG_VIDEO_H264_PROFILE_HIGH;
+			log_info("Profile set to HIGH\n");
 			break;
 
 		default:
-			ctx->profile=V4L2_MPEG_VIDEO_H264_PROFILE_MAIN;
+			ctx->profile=V4L2_MPEG_VIDEO_H264_PROFILE_HIGH;
+			log_info("Profile defaulting to HIGH\n");
 			break;
 	}
 
+	ctx->bitrate = param->bitrate;
+	ctx->peak_bitrate = param->peak_bitrate;
+	log_info("Bitrate %u peak %u\n", ctx->bitrate, ctx->peak_bitrate);
+	ctx->raw_pixfmt = V4L2_PIX_FMT_YUV420M;
+	if (codingType == NV_VIDEO_CodingH264)
+	{
+		ctx->encoder_pixfmt = V4L2_PIX_FMT_H264;
+	}	else if (codingType == NV_VIDEO_CodingHEVC)
+	{
+		ctx->encoder_pixfmt = V4L2_PIX_FMT_H265;
+	}
+	ctx->iframe_interval = param->iframe_interval;
+	log_info("iframe_interval %u\n", ctx->iframe_interval);
+	ctx->idr_interval = param->idr_interval;
+	log_info("idr_interval %u\n", ctx->idr_interval);
+	ctx->fps_n = param->fps_n;
+	log_info("fps_n %u\n", ctx->fps_n);
+	ctx->fps_d = param->fps_d;
+	log_info("fps_d %u\n", ctx->fps_d);
+	ctx->qmax = param->qmax;
+	log_info("qmax %u\n", ctx->qmax);
+	ctx->qmin = param->qmin;
+	log_info("qmin %u\n", ctx->qmin);
+	ctx->num_b_frames = param->max_b_frames;
+	log_info("num_b_frames %u\n", ctx->num_b_frames);
+	ctx->num_reference_frames = param->refs;
+	log_info("num_reference_frames %u\n", ctx->num_reference_frames);
+	ctx->vbv_buffer_size = param->vbv_buffer_size;
+	log_info("vbv_buffer_size %u\n", ctx->vbv_buffer_size);
+	ctx->packets_num = param->capture_num;
+	log_info("packets_num %u\n", ctx->packets_num);
+	ctx->slice_length = param->slice_length;
+	log_info("slice_length %u\n", ctx->slice_length);
+	ctx->insert_sps_pps_at_idr = (param->insert_spspps_idr == 1) ? true : false;
+	log_info("insert_sps_pps_at_idr %u\n", ctx->insert_sps_pps_at_idr);
+	ctx->max_perf = true;
+	ctx->enable_extended_colorformat = false;
+	ctx->enableLossless = (param->enableLossless > 0) ? true : false;
+	ctx->blocking_mode = true; // TODO non-blocking mode support
+	ctx->capPlaneGotEOS = false;
+	ctx->flushing = false;
+	ctx->enable_slice_level_encode = (param->enable_slice_level_encode == 1) ? true : false;
+	log_info("enable_slice_level_encode %u\n", ctx->enable_slice_level_encode);
+	ctx->disable_cabac = (param->disable_cabac == 1) ? true : false;
+	if (param->mode_vbr) {
+		ctx->ratecontrol = V4L2_MPEG_VIDEO_BITRATE_MODE_VBR;
+		log_info("RC VBR\n");
+	} else {
+		ctx->ratecontrol = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR;
+		log_info("RC CBR\n");
+	}
 	switch(param->level)
 	{
 		case 10:
 			ctx->level=V4L2_MPEG_VIDEO_H264_LEVEL_1_0;
+			log_info("Level 1.0\n");
 			break;
 		case 11:
 			ctx->level=V4L2_MPEG_VIDEO_H264_LEVEL_1_1;
+			log_info("Level 1.1\n");
 			break;
 		case 12:
 			ctx->level=V4L2_MPEG_VIDEO_H264_LEVEL_1_2;
+			log_info("Level 1.2\n");
 			break;
 		case 13:
 			ctx->level=V4L2_MPEG_VIDEO_H264_LEVEL_1_3;
+			log_info("Level 1.3\n");
 			break;
 		case 20:
 			ctx->level=V4L2_MPEG_VIDEO_H264_LEVEL_2_0;
+			log_info("Level 2.0\n");
 			break;
 		case 21:
 			ctx->level=V4L2_MPEG_VIDEO_H264_LEVEL_2_1;
+			log_info("Level 2.1\n");
 			break;
 		case 22:
 			ctx->level=V4L2_MPEG_VIDEO_H264_LEVEL_2_2;
+			log_info("Level 2.2\n");
 			break;
 		case 30:
 			ctx->level=V4L2_MPEG_VIDEO_H264_LEVEL_3_0;
+			log_info("Level 3.0\n");
 			break;
 		case 31:
 			ctx->level=V4L2_MPEG_VIDEO_H264_LEVEL_3_1;
+			log_info("Level 3.1\n");
 			break;
 		case 32:
 			ctx->level=V4L2_MPEG_VIDEO_H264_LEVEL_3_2;
+			log_info("Level 3.2\n");
 			break;
 		case 40:
 			ctx->level=V4L2_MPEG_VIDEO_H264_LEVEL_4_0;
+			log_info("Level 4.0\n");
 			break;
 		case 41:
 			ctx->level=V4L2_MPEG_VIDEO_H264_LEVEL_4_1;
+			log_info("Level 4.1\n");
 			break;
 		case 42:
 			ctx->level=V4L2_MPEG_VIDEO_H264_LEVEL_4_2;
+			log_info("Level 4.2\n");
 			break;
 		case 50:
 			ctx->level=V4L2_MPEG_VIDEO_H264_LEVEL_5_0;
+			log_info("Level 5.0\n");
 			break;
 		case 51:
 			ctx->level=V4L2_MPEG_VIDEO_H264_LEVEL_5_1;
+			log_info("Level 5.1\n");
 			break;
 		default:
 			ctx->level=V4L2_MPEG_VIDEO_H264_LEVEL_5_1;
-			break;	
+			log_info("Level defaulting to 5.1\n");
+			break;
 	}
-
 	switch(param->hw_preset_type){
 		case 1:
 			ctx->hw_preset_type = V4L2_ENC_HW_PRESET_ULTRAFAST;
+			log_info("Preset ultrafast\n");
 			break;
 		case 2:
 			ctx->hw_preset_type = V4L2_ENC_HW_PRESET_FAST;
+			log_info("Preset fast\n");
 			break;
 		case 3:
 			ctx->hw_preset_type = V4L2_ENC_HW_PRESET_MEDIUM;
+			log_info("Preset medium\n");
 			break;
 		case 4:
 			ctx->hw_preset_type = V4L2_ENC_HW_PRESET_SLOW;
+			log_info("Preset slow\n");
 			break;
 		default:
 			ctx->hw_preset_type = V4L2_ENC_HW_PRESET_MEDIUM;
+			log_info("Preset defaulting to medium\n");
 			break;
 	}
-
-	if(param->enableLossless)
-		ctx->enableLossless=true;
-
-	if(param->mode_vbr)
-		ctx->ratecontrol=V4L2_MPEG_VIDEO_BITRATE_MODE_VBR;
-
-	if(codingType==NV_VIDEO_CodingH264){
-		ctx->encoder_pixfmt=V4L2_PIX_FMT_H264;
-	}else if(codingType==NV_VIDEO_CodingHEVC){
-		ctx->encoder_pixfmt=V4L2_PIX_FMT_H265;
+	switch(param->slice_length_type){
+		case 0:
+			ctx->slice_length_type = V4L2_ENC_SLICE_LENGTH_TYPE_BITS;
+			break;
+		case 1:
+			ctx->slice_length_type = V4L2_ENC_SLICE_LENGTH_TYPE_MBLK;
+			break;
+		default:
+			ctx->slice_length_type = V4L2_ENC_SLICE_LENGTH_TYPE_BITS;
+			break;
 	}
+	ctx->pktPool = new NVMPI_bufPool<nvPacket *>();
+
 	if(ctx->blocking_mode)
 	{
 		ctx->enc=NvVideoEncoder::createVideoEncoder("enc0");
@@ -324,29 +395,10 @@ nvmpictx* nvmpi_create_encoder(nvCodingType codingType,nvEncParam * param)
 	}
 	TEST_ERROR(!ctx->enc, "Could not create encoder",ret);
 
-	ret = ctx->enc->setCapturePlaneFormat(ctx->encoder_pixfmt, ctx->width,ctx->height, NVMPI_ENC_CHUNK_SIZE);
-
+	ret = ctx->enc->setCapturePlaneFormat(ctx->encoder_pixfmt, ctx->width, ctx->height, NVMPI_ENC_CHUNK_SIZE);
 	TEST_ERROR(ret < 0, "Could not set output plane format", ret);
 
-	switch (ctx->profile)
-	{
-		case V4L2_MPEG_VIDEO_H265_PROFILE_MAIN10:
-			ctx->raw_pixfmt = V4L2_PIX_FMT_P010M;
-			break;
-		case V4L2_MPEG_VIDEO_H265_PROFILE_MAIN:
-		default:
-			ctx->raw_pixfmt = V4L2_PIX_FMT_YUV420M;
-	}
-
-	if (ctx->enableLossless && codingType == NV_VIDEO_CodingH264)
-	{
-		ctx->profile = V4L2_MPEG_VIDEO_H264_PROFILE_HIGH_444_PREDICTIVE;
-		ret = ctx->enc->setOutputPlaneFormat(V4L2_PIX_FMT_YUV444M, ctx->width,ctx->height);
-	}
-	else{
-		ret = ctx->enc->setOutputPlaneFormat(ctx->raw_pixfmt, ctx->width,ctx->height);
-	}
-
+	ret = ctx->enc->setOutputPlaneFormat(ctx->raw_pixfmt, ctx->width, ctx->height);
 	TEST_ERROR(ret < 0, "Could not set output plane format", ret);
 
 	ret = ctx->enc->setBitrate(ctx->bitrate);
@@ -394,36 +446,34 @@ nvmpictx* nvmpi_create_encoder(nvCodingType codingType,nvEncParam * param)
 		ret = ctx->enc->setRateControlMode(ctx->ratecontrol);
 		TEST_ERROR(ret < 0, "Could not set encoder rate control mode", ret);
 
-		if (ctx->ratecontrol == V4L2_MPEG_VIDEO_BITRATE_MODE_VBR)
-		{
+		// if (ctx->ratecontrol == V4L2_MPEG_VIDEO_BITRATE_MODE_VBR)
+		// {
 			uint32_t peak_bitrate;
-			//TODO log warning?
 			if (ctx->peak_bitrate < ctx->bitrate)
 				peak_bitrate = 1.2f * ctx->bitrate;
 			else
 				peak_bitrate = ctx->peak_bitrate;
 			ret = ctx->enc->setPeakBitrate(peak_bitrate);
 			TEST_ERROR(ret < 0, "Could not set encoder peak bitrate", ret);
-		}
+		// }
 	}
 
 	ret = ctx->enc->setIDRInterval(ctx->idr_interval);
 	TEST_ERROR(ret < 0, "Could not set encoder IDR interval", ret);
 
 	if(ctx->qmax>0 ||ctx->qmin >0){
-		ctx->enc->setQpRange(ctx->qmin, ctx->qmax, ctx->qmin,ctx->qmax, ctx->qmin, ctx->qmax);	
+		ctx->enc->setQpRange(ctx->qmin, ctx->qmax, ctx->qmin,ctx->qmax, ctx->qmin, ctx->qmax);
 	}
 	ret = ctx->enc->setIFrameInterval(ctx->iframe_interval);
 	TEST_ERROR(ret < 0, "Could not set encoder I-Frame interval", ret);
-	
-    if(ctx->max_perf)
-    {
-        /* Enable maximum performance mode by disabling internal DFS logic.
-           NOTE: This enables encoder to run at max clocks */
+
+	if(ctx->max_perf){
+		/* Enable maximum performance mode by disabling internal DFS logic.
+				NOTE: This enables encoder to run at max clocks */
 		ret = ctx->enc->setMaxPerfMode(ctx->max_perf);
 		TEST_ERROR(ret < 0, "Error while setting encoder to max perf", ret);
 	}
-	
+
 	if(ctx->insert_sps_pps_at_idr){
 		ret = ctx->enc->setInsertSpsPpsAtIdrEnabled(true);
 		TEST_ERROR(ret < 0, "Could not set insertSPSPPSAtIDR", ret);
@@ -431,7 +481,28 @@ nvmpictx* nvmpi_create_encoder(nvCodingType codingType,nvEncParam * param)
 
 	ret = ctx->enc->setFrameRate(ctx->fps_n, ctx->fps_d);
 	TEST_ERROR(ret < 0, "Could not set framerate", ret);
-	
+
+	if (ctx->slice_length)
+	{
+		/* Set slice length value for encoder */
+		ret = ctx->enc->setSliceLength(ctx->slice_length_type, ctx->slice_length);
+		TEST_ERROR(ret < 0, "Could not set slice length params", cleanup);
+	}
+
+	if (ctx->enable_slice_level_encode)
+	{
+		/* Enable slice level encode for encoder */
+		ret = ctx->enc->setSliceLevelEncode(true);
+		TEST_ERROR(ret < 0, "Could not set slice level encode", cleanup);
+	}
+
+	if (ctx->disable_cabac)
+	{
+		/* Disable CABAC entropy encoding */
+		ret = ctx->enc->setCABAC(false);
+		TEST_ERROR(ret < 0, "Could not set disable CABAC", cleanup);
+	}
+
 	//ret = ctx->enc->output_plane.setupPlane(V4L2_MEMORY_USERPTR, ctx->packets_num, false, true);
 	ret = ctx->enc->output_plane.setupPlane(V4L2_MEMORY_MMAP, ctx->packets_num, true, false);
 	//ret = setup_output_dmabuf(ctx,ctx->packets_num);
@@ -511,7 +582,7 @@ int copyFrameToNvBuf(nvFrame* frame, NvBuffer& buffer)
 int nvmpi_encoder_put_frame(nvmpictx* ctx,nvFrame* frame)
 {
 	if(ctx->flushing) return -2;
-	
+
 	int ret;
 	struct v4l2_buffer v4l2_buf;
 	struct v4l2_plane planes[MAX_PLANES];
@@ -530,7 +601,7 @@ int nvmpi_encoder_put_frame(nvmpictx* ctx,nvFrame* frame)
 		nvBuffer=ctx->enc->output_plane.getNthBuffer(ctx->index);
 		v4l2_buf.index = ctx->index;
 		ctx->index++;
-		
+
 		/*
 		v4l2_buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 		v4l2_buf.memory = V4L2_MEMORY_DMABUF;
@@ -555,7 +626,7 @@ int nvmpi_encoder_put_frame(nvmpictx* ctx,nvFrame* frame)
 			return false;
 		}
 	}
-	
+
 	if(frame)
 	{
 		copyFrameToNvBuf(frame, *nvBuffer);
@@ -624,7 +695,7 @@ void nvmpi_encoder_qEmptyPacket(nvmpictx* ctx,nvPacket* packet)
 int nvmpi_encoder_get_packet(nvmpictx* ctx,nvPacket** packet)
 {
 	nvPacket* pkt = ctx->pktPool->dqFilledBuf();
-	
+
 	if(!pkt)
 	{
 		if(!ctx->flushing) return -1;
@@ -637,7 +708,7 @@ int nvmpi_encoder_get_packet(nvmpictx* ctx,nvPacket** packet)
 		}
 		if(!pkt) return -2; //if got eos
 	}
-	
+
 	*packet = pkt;
 	return 0;
 }
@@ -677,7 +748,7 @@ int nvmpi_encoder_close(nvmpictx* ctx)
         }
     }
     */
-	
+
 	delete ctx->enc;
 	delete ctx->pktPool;
 	delete ctx;

@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 
-//Maximum size of the encoded buffers on the capture plane in bytes 
+//Maximum size of the encoded buffers on the capture plane in bytes
 #define NVMPI_ENC_CHUNK_SIZE 2*1024*1024
 
 typedef struct nvmpictx nvmpictx;
@@ -23,6 +23,8 @@ typedef struct _NVENCPARAM{
 	char enableLossless;
 	char mode_vbr;
 	char insert_spspps_idr;
+	char enable_slice_level_encode;
+	char disable_cabac;
 	unsigned int iframe_interval;
 	unsigned int idr_interval;
 	unsigned int fps_n;
@@ -34,7 +36,9 @@ typedef struct _NVENCPARAM{
 	unsigned int qmin;
 	unsigned int hw_preset_type;
 	unsigned int vbv_buffer_size; //virtual buffer size of the encoder
-	
+	unsigned int slice_length;
+	unsigned int slice_length_type;
+
 } nvEncParam;
 
 typedef struct _NVPACKET{
